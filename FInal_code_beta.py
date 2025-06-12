@@ -9,6 +9,7 @@ import sys #skeleton
 import math #rounding down and up 
 import json #saving the settings
 import trimesh
+import csv
 from shapely import affinity
 from collections import Counter
 from shapely.validation import make_valid 
@@ -197,7 +198,7 @@ def adjust_probabilities(frequency_targets, placed_counts, total_tiles_placed, t
             adjusted_weights[tile_type] = 0.0
     total_weight = sum(adjusted_weights.values())
     if total_weight == 0:
-        print("[WARNING] Total adjusted weight is zero — fallback to uniform over allowed.")
+        #print("[WARNING] Total adjusted weight is zero — fallback to uniform over allowed.")
         allowed = [t for t in [0, 2, 3, 4] if tile_possibility_matrix[tile_type_to_index[t], 0] == 1]
         return {t: 1.0 / len(allowed) for t in allowed}
     return {
@@ -248,12 +249,19 @@ def generation_demo_2_filter_tile_options(
 
     # --- STEP 3: Frequency-based choice ---
     if not possible_R:
-        print(f"[Warning] No valid tile types at ({x},{y}) — fallback to tile 0")
+        #print(f"[Warning] No valid tile types at ({x},{y}) — fallback to tile 0")
         return 0
 
     adjusted_frequencies = {t: frequencies.get(t, 1.0) for t in possible_R}
     total = sum(adjusted_frequencies.values())
-    probabilities = [adjusted_frequencies[t] / total for t in possible_R]
+    total = sum(adjusted_frequencies.values())
+
+    if total > 0:
+        probabilities = [adjusted_frequencies[t] / total for t in possible_R]
+    else:
+        #print(f"[WARNING] Total adjusted weight is zero at ({x}, {y}) — fallback to uniform.")
+        fallback = possible_R or list(VALID_TILES)
+        probabilities = [1.0 / len(fallback) for _ in fallback]
 
     return random.choices(possible_R, probabilities)[0]
 
@@ -653,9 +661,8 @@ def generate_blend_mask(grid_height, grid_width, phase_rows, phase_cols,
                             blended_phases_map[y][x].add(own_phase_idx)
                             neighbor_idx = get_neighbor_phase_index(y, x, "top",
                                 tiles_per_phase_y, tiles_per_phase_x, phase_cols, phase_rows)
-                            if neighbor_idx is not None:
+                            if neighbor_idx is not None and neighbor_idx != own_phase_idx:
                                 blended_phases_map[y][x].add(neighbor_idx)
-
             # BOTTOM transition zone → shifted DOWN from current phase
             for dy in range(1, bottom + 1):
                 y = start_y + tiles_per_phase_y - 1 + dy
@@ -667,7 +674,7 @@ def generate_blend_mask(grid_height, grid_width, phase_rows, phase_cols,
                             blended_phases_map[y][x].add(own_phase_idx)
                             neighbor_idx = get_neighbor_phase_index(y, x, "bottom",
                                 tiles_per_phase_y, tiles_per_phase_x, phase_cols, phase_rows)
-                            if neighbor_idx is not None:
+                            if neighbor_idx is not None and neighbor_idx != own_phase_idx:
                                 blended_phases_map[y][x].add(neighbor_idx)
 
             # LEFT transition zone → shifted LEFT from current phase
@@ -681,7 +688,7 @@ def generate_blend_mask(grid_height, grid_width, phase_rows, phase_cols,
                             blended_phases_map[y][x].add(own_phase_idx)
                             neighbor_idx = get_neighbor_phase_index(y, x, "left",
                                 tiles_per_phase_y, tiles_per_phase_x, phase_cols, phase_rows)
-                            if neighbor_idx is not None:
+                            if neighbor_idx is not None and neighbor_idx != own_phase_idx:
                                 blended_phases_map[y][x].add(neighbor_idx)
 
             # RIGHT transition zone → shifted RIGHT from current phase
@@ -695,7 +702,7 @@ def generate_blend_mask(grid_height, grid_width, phase_rows, phase_cols,
                             blended_phases_map[y][x].add(own_phase_idx)
                             neighbor_idx = get_neighbor_phase_index(y, x, "right",
                                 tiles_per_phase_y, tiles_per_phase_x, phase_cols, phase_rows)
-                            if neighbor_idx is not None:
+                            if neighbor_idx is not None and neighbor_idx != own_phase_idx:
                                 blended_phases_map[y][x].add(neighbor_idx)
 
     return blend_mask, direction_map, blended_phases_map
@@ -760,21 +767,45 @@ def get_effective_transition_tile_policy(
     row_in_phase = y % tiles_per_phase_y
     col_in_phase = x % tiles_per_phase_x
     sorted_pids = sorted(phase_indices)
-
+    current_phase = phase_map[y][x]
     if len(sorted_pids) == 1:
         weights = {sorted_pids[0]: 1.0}
-
     elif len(sorted_pids) == 2:
+        pid_from = current_phase
+        pid_to = next((pid for pid in sorted_pids if pid != pid_from), pid_from)
+
         if directions == {"top"} or directions == {"bottom"}:
             alpha = row_in_phase / tiles_per_phase_y
+            if "top" in directions:
+                weights = {
+                    pid_from: alpha,
+                    pid_to: 1 - alpha
+                }
+            else:
+                weights = {
+                    pid_from: 1 - alpha,
+                    pid_to: alpha
+                }
+
         elif directions == {"left"} or directions == {"right"}:
             alpha = col_in_phase / tiles_per_phase_x
+            if "left" in directions:
+                weights = {
+                    pid_from: alpha,
+                    pid_to: 1 - alpha
+                }
+            else:
+                weights = {
+                    pid_from: 1 - alpha,
+                    pid_to: alpha
+                }
+
         else:
-            alpha = 0.5  # fallback
-        weights = {
-            sorted_pids[0]: 1 - alpha,
-            sorted_pids[1]: alpha
-        }
+            # Unclear case — fallback to even
+            weights = {
+                sorted_pids[0]: 0.5,
+                sorted_pids[1]: 0.5
+            }
 
     elif len(sorted_pids) == 4:
         alpha_x = col_in_phase / tiles_per_phase_x
@@ -790,11 +821,21 @@ def get_effective_transition_tile_policy(
         # Fallback: equal weights if 3 or unexpected count
         weights = {pid: 1.0 / len(sorted_pids) for pid in sorted_pids}
 
-    # Blended target frequencies
+    # Blended target frequencies (ignore zero-only contributions)
     blended_freq = {t: 0.0 for t in VALID_TILES}
+    normalization = {t: 0.0 for t in VALID_TILES}
+
     for pid, weight in weights.items():
         for t in VALID_TILES:
-            blended_freq[t] += weight * freqs_by_phase[pid].get(t, 0.0)
+            val = freqs_by_phase[pid].get(t, 0.0)
+            if val > 0.0:
+                blended_freq[t] += weight * val
+                normalization[t] += weight
+
+    # Normalize blended frequencies only where applicable
+    for t in VALID_TILES:
+        if normalization[t] > 0:
+            blended_freq[t] /= normalization[t]
 
 
     # Adaptive Correction Based on Row/Column Placement
@@ -1370,8 +1411,6 @@ class MainApp(QWidget):
             loaded = json.load(f)
         if "stl_dimensions_mm" in loaded:
             desired_dims = loaded["stl_dimensions_mm"].get("desired", [50, 80])
-            self.blend_checkbox.setChecked(loaded.get("blend_enabled", False))
-            self.harshness_input.setValue(loaded.get("blend_harshness", 0.3))
             self.stl_width_mm.setValue(int(desired_dims[0]))
             self.stl_height_mm.setValue(int(desired_dims[1]))
         layout = loaded.get("phase_layout", {})
@@ -1387,12 +1426,14 @@ class MainApp(QWidget):
         self.add_vertical_walls.setChecked(walls.get("vertical", True))
         # self.base_plate_checkbox.setChecked(bool(loaded.get("add_base_plate", False)))
         self.output_path.setText(str(loaded.get("output_path", "")))
-        self.update_phase_config()
         self.computed_grid_width = loaded.get("grid_width", 0)
         self.computed_grid_height = loaded.get("grid_height", 0)
         self.tiles_per_phase_x = loaded.get("tiles_per_phase_x", 0)
         self.tiles_per_phase_y = loaded.get("tiles_per_phase_y", 0)
+        self.blend_checkbox.setChecked(loaded.get("blend_enabled", False))
+        self.harshness_input.setValue(loaded.get("blend_harshness", 0.3))
         self.transition_layer = loaded.get("transition_layer", {"x": 0, "y": 0})
+        self.update_phase_config()
         phase_map_raw = loaded.get("phase_map")
         if phase_map_raw:
             self.phase_map = np.array(phase_map_raw)
@@ -1595,7 +1636,8 @@ class MainApp(QWidget):
             layout_rows=phase_rows,
             layout_cols=phase_cols
         )
-
+        x_shrink = 0
+        y_shrink = 0
         if blend_enabled:
             x_shrink = self.transition_layer.get("x", 0)
             y_shrink = self.transition_layer.get("y", 0)
@@ -2551,6 +2593,13 @@ def main_simulation_logic(settings):
     blended_phases_map = [
     [set(cell) for cell in row] for row in settings.get("blended_phases_map", [[]])
 ]
+    
+    np.savetxt(os.path.join(OUTPUT_PATH, "blend_mask.csv"), blend_mask.astype(int), fmt="%d", delimiter=",")
+    # --- Save direction_map as CSV (string representation of sets) ---
+    with open(os.path.join(OUTPUT_PATH, "blend_directions.csv"), "w", newline='') as f:
+        writer = csv.writer(f)
+        for row in blend_directions:
+            writer.writerow([",".join(sorted(d)) if d else "" for d in row])
     # print("[DEBUG] Transition zone — x:", x_shrink, "y:", y_shrink)
     # #print("[DEBUG] Blend mask coverage:")
     # #print("Total blend tiles:", np.sum(blend_mask))
