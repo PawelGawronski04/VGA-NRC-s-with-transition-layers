@@ -10,16 +10,13 @@ import math #rounding down and up
 import json #saving the settings
 import trimesh
 import csv
+import os 
 from shapely import affinity
-from collections import Counter
 from shapely.validation import make_valid 
 from shapely.geometry import LineString, Polygon, MultiPolygon, box
 from shapely.ops import unary_union
 import svgwrite
-import copy
 from svgwrite.path import Path
-from xml.etree import ElementTree as ET
-import io
 import shutil  #file management lib
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QSpinBox, QDoubleSpinBox, QVBoxLayout, QSizePolicy,
@@ -33,99 +30,163 @@ from PyQt5.QtCore import Qt, QByteArray
 TILE_SIZE = 3
 #########################################################################################################################################################
 # Loop check fucntion - no internal reinforced unconnected structure within a reinforced structure 
-def would_tile2_form_grain(grid, x, y, max_steps=400):
+def create_simulation_tile(up=0, right=0, down=0, left=0):
+    tile = np.zeros((3, 3), dtype=int)
+    tile[0, 1] = up
+    tile[1, 2] = right
+    tile[2, 1] = down
+    tile[1, 0] = left
+    return tile
+
+def merged_grain_check(grid, x, y, max_steps=400):
     deltas = {
-        'up': (-1, 0),
-        'down': (1, 0),
-        'left': (0, -1),
-        'right': (0, 1)
+        'up': (-1, 0), 'down': (1, 0),
+        'left': (0, -1), 'right': (0, 1)
     }
     wall_map = {
-        'up': (0, 1),
-        'down': (2, 1),
-        'left': (1, 0),
-        'right': (1, 2)
+        'up': (0, 1), 'down': (2, 1),
+        'left': (1, 0), 'right': (1, 2)
     }
     reverse_map = {
-        'up': 'down',
-        'down': 'up',
-        'left': 'right',
-        'right': 'left'
+        'up': 'down', 'down': 'up',
+        'left': 'right', 'right': 'left'
     }
-    H= GRID_HEIGHT
-    W= GRID_WIDTH
-    top_tile = grid[y - 1, x]
-    left_tile = grid[y, x - 1]
 
-    # Simulate tile_2 being placed at (x, y)
-    simulated_tile = np.zeros((3, 3), dtype=int)
-    simulated_tile[0, 1] = 1  # top
-    simulated_tile[1, 0] = 1  # left
-    grid_backup = grid[y, x].copy()
+    def tile_sum(tile):
+        return int(np.sum(tile)) if tile is not None else 0
+
+    def is_type2(tile, required):
+        return tile_sum(tile) == 2 and all(tile[r, c] == 1 for r, c in required)
+
+    def is_type3(tile, forbidden):
+        return tile_sum(tile) == 4 and all(tile[r, c] == 0 for r, c in forbidden)
+
+    H, W = grid.shape[:2]
+    if x == 0 or y == 0:
+        return False
+
+    top = grid[y - 1, x]
+    left = grid[y, x - 1]
+    diag = grid[y - 1, x - 1]
+
+    # === 4-Tile Diagonal Type-2 Grain Check
+    if all(t is not None for t in [top, left, diag]):
+        if is_type2(top, [(1, 0), (2, 1)]) and \
+           is_type2(left, [(0, 1), (1, 2)]) and \
+           is_type2(diag, [(1, 2), (2, 1)]):
+            #print(f"[❌ Diagonal loop detected around ({x},{y})]")
+            return True
+
+    # === Extended 6-Tile Diagonal Vertical Type-3 Bridge
+    if x >= 2 and y >= 2:
+        tl = grid[y - 2, x - 2]
+        t3 = grid[y - 2, x - 1]
+        tr = grid[y - 2, x]
+        l3 = grid[y - 1, x - 2]
+        if all(t is not None for t in [tl, t3, tr, l3]):
+            if is_type2(tl, [(1, 2), (2, 1)]) and \
+               is_type2(tr, [(1, 0), (2, 1)]) and \
+               is_type3(t3, [(1, 0)]) and \
+               is_type3(l3, [(1, 2)]):
+                #print(f"[❌ Extended vertical diagonal loop around ({x},{y})]")
+                return True
+
+    # === Extended 6-Tile Diagonal Horizontal Type-3 Bridge
+    if x >= 2 and y >= 2:
+        tr = grid[y - 2, x]
+        r3 = grid[y - 1, x + 1] if x + 1 < W else None
+        rt = grid[y - 2, x + 1] if x + 1 < W else None
+        if all(t is not None for t in [tr, r3, rt]):
+            if is_type2(tr, [(1, 0), (2, 1)]) and \
+               is_type2(grid[y - 1, x - 1], [(0, 1), (1, 2)]) and \
+               is_type3(r3, [(0, 1)]) and \
+               is_type3(rt, [(2, 1)]):
+                #print(f"[❌ Extended horizontal diagonal loop around ({x},{y})]")
+                return True
+
+    # === Horizontal Type-3 Trap Check
+    if x >= 2:
+        left_1 = grid[y, x - 1]
+        left_2 = grid[y, x - 2]
+        if all(t is not None for t in [left_1, left_2]):
+            if tile_sum(left_1) == 4 and tile_sum(left_2) == 4:
+                #print(f"[❌ Horizontal type-3 trap detected at ({x},{y})]")
+                return True
+
+    # === Vertical Type-3 Trap Check
+    if y >= 2:
+        top_1 = grid[y - 1, x]
+        top_2 = grid[y - 2, x]
+        if all(t is not None for t in [top_1, top_2]):
+            if tile_sum(top_1) == 4 and tile_sum(top_2) == 4:
+                #print(f"[❌ Vertical type-3 trap detected at ({x},{y})]")
+                return True
+
+    # === Flood Fill Walk Check (Simulation)
+    top_tile = grid[y - 1, x] if y - 1 >= 0 else None
+    left_tile = grid[y, x - 1] if x - 1 >= 0 else None
+
+    simulated_tile = create_simulation_tile(up=1, left=1)
+    grid_backup = grid[y, x]
     grid[y, x] = simulated_tile
 
-    # Start flood fill from left and top neighbors
     stack = []
-    if top_tile[2, 1] == 1 and simulated_tile[0, 1] == 1:
+    if top_tile is not None and top_tile[2, 1] == 1:
         stack.append((y - 1, x))
-    if left_tile[1, 2] == 1 and simulated_tile[1, 0] == 1:
+    if left_tile is not None and left_tile[1, 2] == 1:
         stack.append((y, x - 1))
 
     visited = set()
     steps = 0
+    escaped = False
 
     while stack and steps < max_steps:
         cy, cx = stack.pop()
 
-        # Detect return to entry point (possible loop)
         if (cy, cx) == (y, x):
             if steps > 3:
-                #print(f"[❌  Loop Detected] Flood returned to tile_2 at ({x},{y}) after {steps} steps")
-                grid[y, x] = grid_backup
-                return True
-            else:
-                # Too early, might just be initial ping back
-                continue
+                #print(f"[❌ Loop Detected] Return to ({x},{y}) after {steps} steps")
+                break
+            continue
 
         if (cy, cx) in visited:
             continue
         visited.add((cy, cx))
 
-        for direction in ['up', 'down', 'left', 'right']:
+        for direction in deltas:
             dy, dx = deltas[direction]
             ny, nx = cy + dy, cx + dx
 
             if not (0 <= ny < H and 0 <= nx < W):
                 if grid[cy, cx][wall_map[direction]] == 1:
                     if (direction == 'up' and cy == 0) or \
-                    (direction == 'down' and cy == H - 1) or \
-                    (direction == 'left' and cx == 0) or \
-                    (direction == 'right' and cx == W - 1):
-                        #print(f"[✅ Escaped] through open boundary at ({cy},{cx}) direction {direction}")
-                        grid[y, x] = grid_backup
-                        return False
+                       (direction == 'down' and cy == H - 1) or \
+                       (direction == 'left' and cx == 0) or \
+                       (direction == 'right' and cx == W - 1):
+                        #print(f"[✅ Escaped] via boundary at ({cy},{cx})")
+                        escaped = True
+                        break
                 continue
 
-            # New rule: if we cross beyond the inserted tile
+            neighbor = grid[ny, nx]
             if ((ny > y and nx == x) or (nx > x and ny == y)) and \
-                (ny, nx) not in visited and \
-                grid[cy, cx][wall_map[direction]] == 1 and \
-                grid[ny, nx][wall_map[reverse_map[direction]]] == 1:
-                #print(f"[✅ Escaped] to unexplored area at ({ny},{nx}) — beyond tile_2 at ({x},{y})")
-                grid[y, x] = grid_backup
-                return False
+               neighbor is not None and np.sum(neighbor) == 0:
+                #print(f"[✅ Escaped] to unassigned at ({ny},{nx})")
+                escaped = True
+                break
 
-            if (ny, nx) in visited:
-                continue
-            if grid[cy, cx][wall_map[direction]] == 1 and grid[ny, nx][wall_map[reverse_map[direction]]] == 1:
+            if neighbor is not None and \
+               grid[cy, cx][wall_map[direction]] == 1 and \
+               neighbor[wall_map[reverse_map[direction]]] == 1 and \
+               (ny, nx) not in visited:
                 stack.append((ny, nx))
 
+        if escaped:
+            break
         steps += 1
 
-    # If flood finishes without escape, this is a grain
-    #print(f"[⚠️  WARNING] tile_2 at ({x},{y}) could form a grain!")
-    grid[y, x] = grid_backup  # restore
-    return True
+    grid[y, x] = grid_backup
+    return not escaped
 #checking the position of the tile in the grid, assigning boolean values to relevant cases left and top tile connectivity, grid boundary cases
 def generation_demo_1_grid_constraints(x, y, grid):
     """Determine tile constraints based on grid boundaries and ensure correct edge tile placement."""
@@ -152,12 +213,9 @@ def generation_demo_1_grid_constraints(x, y, grid):
             constraints["requires_top"] = True
             constraints["active_connections"][3] = 1  # top wall connection
     if constraints["requires_left"] and constraints["requires_top"]:
-        if would_tile2_form_grain(grid, x, y, max_steps=400):
-            constraints["circle"] = True
-        else:
-            constraints["circle"] = False
+        constraints["circle"] = merged_grain_check(grid, x, y, max_steps=400)
     else:
-        constraints["circle"] = False
+        constraints["circle"] =False
     return constraints  
 ############################## BREAK FOR THE COUNTING ANALYSIS PER PHASE TO CORRECT FOR RANDOM GENERATION ON SMAL SCALE OBJECT ####################################
 #basicaly 4 dictironaries comparing what is the expected current state and fixing the wieghts if it is of from the expected, also adjusting the stored output
@@ -207,7 +265,6 @@ def adjust_probabilities(frequency_targets, placed_counts, total_tiles_placed, t
     }    
 ############################## CONTINUATION OF THE ACTUAL TILE CHOICE #############################################################################    
 #checking the tile options and using the frequencies to randomly generate the tile that can fit 
-# === Modified DEMO 2 ===
 def generation_demo_2_filter_tile_options(
     constraints, grid, x, y, phase_map, blended_phases_map, blend_mask,
     tile_matrix, frequencies, phase_enforced_rules,
@@ -216,25 +273,29 @@ def generation_demo_2_filter_tile_options(
     possible_R = [0, 2, 3, 4]
 
     # --- STEP 1: PROPAGATION RULES (always enforced) ---
-    if tile_matrix[3, 0] == 0 or (
-        not constraints["requires_left"] and not constraints["boundary_left"] or
-        not constraints["requires_top"] and not constraints["boundary_top"]
-    ):
+    if tile_matrix[0, 0] == 0:
+        possible_R = [t for t in possible_R if t != 0]
+    if tile_matrix[1, 0] == 0:
+        possible_R = [t for t in possible_R if t != 2]
+    if tile_matrix[2, 0] == 0:
+        possible_R = [t for t in possible_R if t != 3]
+    if tile_matrix[3, 0] == 0:
         possible_R = [t for t in possible_R if t != 4]
 
-    if tile_matrix[2, 0] == 0 and (
-        not (constraints["boundary_left"] or constraints["boundary_top"])) and not (
-        constraints["requires_left"] and constraints["requires_top"]
-    ):
-        possible_R = [t for t in possible_R if t != 3]
-
-    if tile_matrix[1, 0] == 0 and constraints["circle"]:
-        possible_R = [t for t in possible_R if t != 2]
-
-    if tile_matrix[0, 0] == 0 or constraints["requires_left"] or constraints["requires_top"]:
+    if constraints["requires_left"] or constraints["requires_top"]:
         possible_R = [t for t in possible_R if t != 0]
 
-    # --- STEP 2: ENFORCED PHASE RULES (adaptive for transition zones) ---
+    if constraints["circle"]:
+        possible_R = [t for t in possible_R if t != 2]
+
+    if not constraints["requires_left"] and not constraints["boundary_left"] and \
+    not constraints["requires_top"] and not constraints["boundary_top"]:
+        possible_R = [t for t in possible_R if t != 4]
+
+    if not (constraints["requires_left"] or constraints["requires_top"]) and \
+    not (constraints["boundary_left"] or constraints["boundary_top"]):
+        possible_R = [t for t in possible_R if t != 3]
+
     phase = phase_map[y][x]
     allowed_types = evaluate_enforced_rules(
         x, y, grid, constraints, phase, phase_enforced_rules,
@@ -243,7 +304,8 @@ def generation_demo_2_filter_tile_options(
         blend_weight_map=blend_weight_map,
         tiles_per_phase_x=tiles_per_phase_x,
         tiles_per_phase_y=tiles_per_phase_y,
-        direction_map=direction_map
+        direction_map=direction_map,
+        phase_map=phase_map
     )
     possible_R = [r for r in possible_R if r in allowed_types]
 
@@ -259,8 +321,7 @@ def generation_demo_2_filter_tile_options(
     if total > 0:
         probabilities = [adjusted_frequencies[t] / total for t in possible_R]
     else:
-        #print(f"[WARNING] Total adjusted weight is zero at ({x}, {y}) — fallback to uniform.")
-        fallback = possible_R or list(VALID_TILES)
+        fallback = possible_R 
         probabilities = [1.0 / len(fallback) for _ in fallback]
 
     return random.choices(possible_R, probabilities)[0]
@@ -269,7 +330,7 @@ def generation_demo_2_filter_tile_options(
 def evaluate_enforced_rules(
     x, y, grid, constraints, phase, phase_rules,
     blend_mask=None, blended_phases_map=None, blend_weight_map=None,
-    tiles_per_phase_x=None, tiles_per_phase_y=None, direction_map=None
+    tiles_per_phase_x=None, tiles_per_phase_y=None, direction_map=None,  phase_map=None
 ):
     allowed_types = {0, 2, 3, 4}
     left_tile = grid[y, x - 1] if x > 0 else None
@@ -286,7 +347,7 @@ def evaluate_enforced_rules(
                 weights = get_rule_blend_weights(
                     x, y,
                     neighbor_phases=blended_phases_map[y][x],
-                    phase_map=phase,
+                    phase_map=phase_map, 
                     tiles_per_phase_x=tiles_per_phase_x,
                     tiles_per_phase_y=tiles_per_phase_y,
                     direction_map=direction_map
@@ -330,24 +391,79 @@ def evaluate_enforced_rules(
     return allowed_types
 
 def get_rule_blend_weights(x, y, neighbor_phases, phase_map, tiles_per_phase_x, tiles_per_phase_y, direction_map):
-    row_in_phase = y % tiles_per_phase_y
-    col_in_phase = x % tiles_per_phase_x
-    weights = {pid: 1.0 / len(neighbor_phases) for pid in neighbor_phases}
+    VALID_TILES = {0, 2, 3, 4}
+    directions = direction_map[y][x] if isinstance(direction_map[y][x], (list, set)) else {direction_map[y][x]}
+    direction = next(iter(directions)) if directions else None
 
-    sorted_pids = sorted(neighbor_phases)
-    if len(sorted_pids) == 2:
-        if "top" in direction_map[y][x] or "bottom" in direction_map[y][x]:
-            alpha = row_in_phase / tiles_per_phase_y
+    current_phase = phase_map[y][x]
+    region_min_x = (x // tiles_per_phase_x) * tiles_per_phase_x
+    region_max_x = region_min_x + tiles_per_phase_x - 1
+    region_min_y = (y // tiles_per_phase_y) * tiles_per_phase_y
+    region_max_y = region_min_y + tiles_per_phase_y - 1
+
+    def compute_alpha(min_y, max_y, min_x, max_x, direction):
+        if direction == "top":
+            return (y - min_y) / max((max_y - min_y), 1)
+        elif direction == "bottom":
+            return (max_y - y) / max((max_y - min_y), 1)
+        elif direction == "left":
+            return (x - min_x) / max((max_x - min_x), 1)
+        elif direction == "right":
+            return (max_x - x) / max((max_x - min_x), 1)
+        else:
+            norm_y = (y - min_y) / max((max_y - min_y), 1)
+            norm_x = (x - min_x) / max((max_x - min_x), 1)
+            return 0.5 * (norm_x + norm_y)
+
+    alpha = compute_alpha(region_min_y, region_max_y, region_min_x, region_max_x, direction)
+
+    # === Assign weights for 2-phase blends ===
+    if len(neighbor_phases) == 2:
+        pid_from = current_phase
+        pid_to = [pid for pid in neighbor_phases if pid != current_phase][0]
+
+        if direction in {"bottom", "right"}:
             weights = {
-                sorted_pids[0]: 1 - alpha,
-                sorted_pids[1]: alpha
+                pid_from: 1.0 - alpha,
+                pid_to: alpha
             }
-        elif "left" in direction_map[y][x] or "right" in direction_map[y][x]:
-            alpha = col_in_phase / tiles_per_phase_x
+        elif direction in {"top", "left"}:
             weights = {
-                sorted_pids[0]: 1 - alpha,
-                sorted_pids[1]: alpha
+                pid_to: alpha,
+                pid_from: 1.0 - alpha
             }
+        else:
+            weights = {pid: 1.0 / len(neighbor_phases) for pid in neighbor_phases}
+
+    # === Assign weights for 3-phase corner blends ===
+    elif len(neighbor_phases) == 3:
+        pid_main = current_phase
+        pid_neighbors = [pid for pid in neighbor_phases if pid != pid_main]
+        pid_top_bottom, pid_left_right = None, None
+
+        for pid in pid_neighbors:
+            if y > 0 and phase_map[y - 1][x] == pid:
+                pid_top_bottom = pid
+            if y < len(phase_map) - 1 and phase_map[y + 1][x] == pid:
+                pid_top_bottom = pid
+            if x > 0 and phase_map[y][x - 1] == pid:
+                pid_left_right = pid
+            if x < len(phase_map[0]) - 1 and phase_map[y][x + 1] == pid:
+                pid_left_right = pid
+
+        beta = (x - region_min_x) / max((region_max_x - region_min_x), 1)
+        alpha = (y - region_min_y) / max((region_max_y - region_min_y), 1)
+
+        main_weight = max(0.0, 1.0 - alpha * 0.4 - beta * 0.4)
+        weights = {pid_main: main_weight}
+        if pid_top_bottom is not None:
+            weights[pid_top_bottom] = alpha * 0.4
+        if pid_left_right is not None:
+            weights[pid_left_right] = beta * 0.4
+
+    else:
+        weights = {pid: 1.0 / len(neighbor_phases) for pid in neighbor_phases}
+
     return weights
 
 def generation_demo_3_assign_remaining_connections(
@@ -562,7 +678,7 @@ def clean_tile_frequencies(freq_dict, valid_tiles={0, 2, 3, 4}):
         for k, v in freq_dict.items()
         if str(k).isdigit() and int(k) in valid_tiles
     }
-    
+        
 def generate_phase_map(grid_width, grid_height, layout_rows, layout_cols):
     phase_map = np.full((grid_height, grid_width), -1, dtype=int)
     row_block_height = grid_height // layout_rows
@@ -585,8 +701,6 @@ def compute_transition_layer(phase_rows, phase_cols, x_shrink, y_shrink):
     for r in range(phase_rows):
         for c in range(phase_cols):
             key = f"{r},{c}"
-
-            # TOP ↔ BOTTOM pair
             if r > 0:
                 margins["top"][key] = y_shrink
                 up_key = f"{r-1},{c}"
@@ -600,8 +714,6 @@ def compute_transition_layer(phase_rows, phase_cols, x_shrink, y_shrink):
                 margins["top"][down_key] = y_shrink
             else:
                 margins["bottom"][key] = 0
-
-            # LEFT ↔ RIGHT pair
             if c > 0:
                 margins["left"][key] = x_shrink
                 left_key = f"{r},{c-1}"
@@ -620,6 +732,7 @@ def compute_transition_layer(phase_rows, phase_cols, x_shrink, y_shrink):
 def get_neighbor_phase_index(y, x, direction, tiles_per_phase_y, tiles_per_phase_x, phase_cols, phase_rows):
     row = y // tiles_per_phase_y
     col = x // tiles_per_phase_x
+
     if direction == "top" and row > 0:
         row -= 1
     elif direction == "bottom" and row < phase_rows - 1:
@@ -629,16 +742,25 @@ def get_neighbor_phase_index(y, x, direction, tiles_per_phase_y, tiles_per_phase
     elif direction == "right" and col < phase_cols - 1:
         col += 1
     else:
-        return None  # Out of bounds
-    return row * phase_cols + col
+        return None
+
+    if 0 <= row < phase_rows and 0 <= col < phase_cols:
+        return row * phase_cols + col
+    return None
+
+def get_current_phase_index(y, x, tiles_per_phase_y, tiles_per_phase_x, phase_cols, phase_rows):
+    row = y // tiles_per_phase_y
+    col = x // tiles_per_phase_x
+
+    if 0 <= row < phase_rows and 0 <= col < phase_cols:
+        return row * phase_cols + col
+    return None
 
 def generate_blend_mask(grid_height, grid_width, phase_rows, phase_cols,
                         tiles_per_phase_y, tiles_per_phase_x, transition_layer):
-
     blend_mask = np.zeros((grid_height, grid_width), dtype=bool)
     direction_map = [[set() for _ in range(grid_width)] for _ in range(grid_height)]
     blended_phases_map = [[set() for _ in range(grid_width)] for _ in range(grid_height)]
-
     for pr in range(phase_rows):
         for pc in range(phase_cols):
             key = f"{pr},{pc}"
@@ -646,66 +768,107 @@ def generate_blend_mask(grid_height, grid_width, phase_rows, phase_cols,
             bottom = transition_layer["bottom"].get(key, 0)
             left = transition_layer["left"].get(key, 0)
             right = transition_layer["right"].get(key, 0)
-            own_phase_idx = pr * phase_cols + pc
+            #own_phase_idx = pr * phase_cols + pc
             start_y = pr * tiles_per_phase_y
             start_x = pc * tiles_per_phase_x
-
-            # TOP transition zone → shifted UP from current phase
+            # TOP
             for dy in range(1, top + 1):
                 y = start_y - dy
                 if 0 <= y < grid_height:
                     for x in range(start_x, start_x + tiles_per_phase_x):
                         if 0 <= x < grid_width:
                             blend_mask[y, x] = True
-                            direction_map[y][x].add("top")
-                            blended_phases_map[y][x].add(own_phase_idx)
-                            neighbor_idx = get_neighbor_phase_index(y, x, "top",
-                                tiles_per_phase_y, tiles_per_phase_x, phase_cols, phase_rows)
-                            if neighbor_idx is not None and neighbor_idx != own_phase_idx:
-                                blended_phases_map[y][x].add(neighbor_idx)
-            # BOTTOM transition zone → shifted DOWN from current phase
+                            direction_map[y][x].add("bottom")
+                            #blended_phases_map[y][x].add(own_phase_idx)
+            # BOTTOM
             for dy in range(1, bottom + 1):
                 y = start_y + tiles_per_phase_y - 1 + dy
                 if 0 <= y < grid_height:
                     for x in range(start_x, start_x + tiles_per_phase_x):
                         if 0 <= x < grid_width:
                             blend_mask[y, x] = True
-                            direction_map[y][x].add("bottom")
-                            blended_phases_map[y][x].add(own_phase_idx)
-                            neighbor_idx = get_neighbor_phase_index(y, x, "bottom",
-                                tiles_per_phase_y, tiles_per_phase_x, phase_cols, phase_rows)
-                            if neighbor_idx is not None and neighbor_idx != own_phase_idx:
-                                blended_phases_map[y][x].add(neighbor_idx)
-
-            # LEFT transition zone → shifted LEFT from current phase
+                            direction_map[y][x].add("top")
+                            #reversed
+            # LEFT
             for dx in range(1, left + 1):
                 x = start_x - dx
                 if 0 <= x < grid_width:
                     for y in range(start_y, start_y + tiles_per_phase_y):
                         if 0 <= y < grid_height:
                             blend_mask[y, x] = True
-                            direction_map[y][x].add("left")
-                            blended_phases_map[y][x].add(own_phase_idx)
-                            neighbor_idx = get_neighbor_phase_index(y, x, "left",
-                                tiles_per_phase_y, tiles_per_phase_x, phase_cols, phase_rows)
-                            if neighbor_idx is not None and neighbor_idx != own_phase_idx:
-                                blended_phases_map[y][x].add(neighbor_idx)
-
-            # RIGHT transition zone → shifted RIGHT from current phase
+                            direction_map[y][x].add("right")
+            # RIGHT
             for dx in range(1, right + 1):
                 x = start_x + tiles_per_phase_x - 1 + dx
                 if 0 <= x < grid_width:
                     for y in range(start_y, start_y + tiles_per_phase_y):
                         if 0 <= y < grid_height:
                             blend_mask[y, x] = True
-                            direction_map[y][x].add("right")
-                            blended_phases_map[y][x].add(own_phase_idx)
+                            direction_map[y][x].add("left")
+    for pr in range(phase_rows):
+        for pc in range(phase_cols):
+            key = f"{pr},{pc}"
+            top = transition_layer["top"].get(key, 0)
+            bottom = transition_layer["bottom"].get(key, 0)
+            left = transition_layer["left"].get(key, 0)
+            right = transition_layer["right"].get(key, 0)                       
+            start_y = pr * tiles_per_phase_y
+            start_x = pc * tiles_per_phase_x
+            y_end = min(start_y + tiles_per_phase_y, grid_height)
+            x_end = min(start_x + tiles_per_phase_x, grid_width)
+            #own
+            for y in range(start_y, y_end):
+                for x in range(start_x, x_end):
+                    if blend_mask[y, x]:
+                        own_idx = get_current_phase_index(y, x, tiles_per_phase_y, tiles_per_phase_x, phase_cols, phase_rows)
+                        if own_idx is not None:
+                            blended_phases_map[y][x].add(own_idx)
+            # TOP
+            for dy in range(1, top + 1):
+                y = start_y - dy
+                if 0 <= y < grid_height:
+                    for x in range(start_x, start_x + tiles_per_phase_x):
+                        if 0 <= x < grid_width:
+                            neighbor_idx = get_neighbor_phase_index(y, x, "bottom",
+                                tiles_per_phase_y, tiles_per_phase_x, phase_cols, phase_rows)
+                            if neighbor_idx is not None:
+                                blended_phases_map[y][x].add(neighbor_idx)
+                            else:
+                                print(f"[Warning] No neighbor phase for ({y}, {x}) in top direction")
+            # # BOTTOM
+            for dy in range(1, bottom + 1):
+                y = start_y + tiles_per_phase_y - 1 + dy
+                if 0 <= y < grid_height:
+                    for x in range(start_x, start_x + tiles_per_phase_x):
+                        if 0 <= x < grid_width:
+                            neighbor_idx = get_neighbor_phase_index(y, x, "top",
+                                tiles_per_phase_y, tiles_per_phase_x, phase_cols, phase_rows)
+                            if neighbor_idx is not None:
+                                blended_phases_map[y][x].add(neighbor_idx)
+                            else:
+                                print(f"[Warning] No neighbor phase for ({y}, {x}) in BOTTOM direction")
+            #  LEFT
+            for dx in range(1, left + 1):
+                x = start_x - dx
+                if 0 <= x < grid_width:
+                    for y in range(start_y, start_y + tiles_per_phase_y):
+                        if 0 <= y < grid_height:
                             neighbor_idx = get_neighbor_phase_index(y, x, "right",
                                 tiles_per_phase_y, tiles_per_phase_x, phase_cols, phase_rows)
-                            if neighbor_idx is not None and neighbor_idx != own_phase_idx:
+                            if neighbor_idx is not None:
                                 blended_phases_map[y][x].add(neighbor_idx)
-
+            #  RIGHT
+            for dx in range(1, right + 1):
+                x = start_x + tiles_per_phase_x - 1 + dx
+                if 0 <= x < grid_width:
+                    for y in range(start_y, start_y + tiles_per_phase_y):
+                        if 0 <= y < grid_height:
+                            neighbor_idx = get_neighbor_phase_index(y, x, "left",
+                                tiles_per_phase_y, tiles_per_phase_x, phase_cols, phase_rows)
+                            if neighbor_idx is not None:
+                                blended_phases_map[y][x].add(neighbor_idx)
     return blend_mask, direction_map, blended_phases_map
+
 
 def get_phase_idx_at(x, y, phase_map):
     return phase_map[y][x] 
@@ -748,149 +911,146 @@ def get_effective_transition_tile_policy(
     x, y,
     phase_map, blended_phases_map, phases,
     constraints, direction_map,
-    tiles_per_phase_x, tiles_per_phase_y,
-    frequency_matrix=None  # new parameter, must be passed
+    frequency_matrix=None,
+    blend_mask=None
 ):
     VALID_TILES = {0, 2, 3, 4}
-    phase_indices = blended_phases_map[y][x]
-    directions = direction_map[y][x] if isinstance(direction_map[y][x], (list, set)) else set()
+    current_phase = phase_map[y][x]
 
-    if not phase_indices:
-        raise ValueError(f"No blended phases for tile ({x},{y})")
+    phase_indices_raw = blended_phases_map[y][x]
+    if isinstance(phase_indices_raw, str):
+        phase_indices = [int(p) for p in phase_indices_raw.split(";")]
+    elif isinstance(phase_indices_raw, (set, list, tuple)):
+        phase_indices = list(phase_indices_raw)
+    else:
+        phase_indices = []
+
+    val = direction_map[y][x]
+    directions = val if isinstance(val, (set, list)) else {val} if pd.notna(val) else set()
+    direction = next(iter(directions)) if directions else None  
+
+    def clean_tile_frequencies(freqs, valid):
+        return {int(k): float(v) for k, v in freqs.items() if int(k) in valid}
 
     freqs_by_phase = {
         pid: clean_tile_frequencies(phases[pid].get("tile_frequencies", {}), VALID_TILES)
         for pid in phase_indices
     }
 
-    # Compute blend weights based on tile position and direction
-    row_in_phase = y % tiles_per_phase_y
-    col_in_phase = x % tiles_per_phase_x
-    sorted_pids = sorted(phase_indices)
-    current_phase = phase_map[y][x]
-    if len(sorted_pids) == 1:
-        weights = {sorted_pids[0]: 1.0}
-    elif len(sorted_pids) == 2:
-        pid_from = current_phase
-        pid_to = next((pid for pid in sorted_pids if pid != pid_from), pid_from)
+    region_tag = blended_phases_map[y][x]
+    H = W = 0
+    if frequency_matrix is not None:
+        H, W = frequency_matrix.shape
 
-        if directions == {"top"} or directions == {"bottom"}:
-            alpha = row_in_phase / tiles_per_phase_y
-            if "top" in directions:
-                weights = {
-                    pid_from: alpha,
-                    pid_to: 1 - alpha
-                }
-            else:
-                weights = {
-                    pid_from: 1 - alpha,
-                    pid_to: alpha
-                }
+    def get_subregion_bounds(region_tag):
+        region_coords = [(yy, xx) for yy in range(H) for xx in range(W)
+                        if blended_phases_map[yy][xx] == region_tag]
+        if not region_coords:
+            return y, y, x, x
 
-        elif directions == {"left"} or directions == {"right"}:
-            alpha = col_in_phase / tiles_per_phase_x
-            if "left" in directions:
-                weights = {
-                    pid_from: alpha,
-                    pid_to: 1 - alpha
-                }
-            else:
-                weights = {
-                    pid_from: 1 - alpha,
-                    pid_to: alpha
-                }
+        ys = [yy for yy, _ in region_coords]
+        xs = [xx for _, xx in region_coords]
+        return min(ys), max(ys), min(xs), max(xs)
 
+    region_min_y, region_max_y, region_min_x, region_max_x = get_subregion_bounds(region_tag)
+
+    def compute_alpha_from_box(min_y, max_y, min_x, max_x, direction):
+        if direction == "top":
+            return (y - min_y) / max((max_y - min_y), 1)  # from top to bottom
+        elif direction == "bottom":
+            return (max_y - y) / max((max_y - min_y), 1)  # from bottom to top
+        elif direction == "left":
+            return (x - min_x) / max((max_x - min_x), 1)  # from left to right
+        elif direction == "right":
+            return (max_x - x) / max((max_x - min_x), 1)  # from right to left
         else:
-            # Unclear case — fallback to even
-            weights = {
-                sorted_pids[0]: 0.5,
-                sorted_pids[1]: 0.5
-            }
+            # fallback if unknown direction
+            norm_y = (y - min_y) / max((max_y - min_y), 1)
+            norm_x = (x - min_x) / max((max_x - min_x), 1)
+            return 0.5 * (norm_x + norm_y)
 
-    elif len(sorted_pids) == 4:
-        alpha_x = col_in_phase / tiles_per_phase_x
-        alpha_y = row_in_phase / tiles_per_phase_y
+    alpha = compute_alpha_from_box(region_min_y, region_max_y, region_min_x, region_max_x, direction)
+
+    if len(phase_indices) == 2:
+        pid_from = current_phase
+        pid_to = [pid for pid in phase_indices if pid != current_phase][0]
+        if direction in {"bottom", "right"}:
+            weights = {
+                pid_from: 1.0 - alpha,
+                pid_to: alpha
+            }
+        elif direction in {"top", "left"}:
+            weights = {
+                pid_to: alpha,
+                pid_from: 1.0 - alpha
+            }
+        else:
+            weights = {pid: 0.5 for pid in phase_indices}
+    elif len(phase_indices) == 3:
+        # Separate main and neighbor phases
+        pid_main = current_phase
+        pid_neighbors = [pid for pid in phase_indices if pid != pid_main]
+
+        # Initialize direction-based assignment
+        pid_top_bottom = None
+        pid_left_right = None
+
+        # Assign pids based on known direction labels
+        if "top" in directions or "bottom" in directions:
+            pid_top_bottom = pid_neighbors[0]
+            pid_left_right = pid_neighbors[1]
+        elif "left" in directions or "right" in directions:
+            pid_left_right = pid_neighbors[0]
+            pid_top_bottom = pid_neighbors[1]
+
+        # Assign alpha and beta weights (row and column progress)
+        beta = (x - region_min_x) / max((region_max_x - region_min_x), 1)
+        alpha = (y - region_min_y) / max((region_max_y - region_min_y), 1)
+
+        # Scale weights — adjust coefficients if needed
+        main_weight = max(0.0, 1.0 - alpha * 0.4 - beta * 0.4)
         weights = {
-            sorted_pids[0]: (1 - alpha_x) * (1 - alpha_y),
-            sorted_pids[1]: alpha_x * (1 - alpha_y),
-            sorted_pids[2]: (1 - alpha_x) * alpha_y,
-            sorted_pids[3]: alpha_x * alpha_y
+            pid_main: main_weight,
+            pid_top_bottom: alpha * 0.4,
+            pid_left_right: beta * 0.4,
         }
 
-    else:
-        # Fallback: equal weights if 3 or unexpected count
-        weights = {pid: 1.0 / len(sorted_pids) for pid in sorted_pids}
-
-    # Blended target frequencies (ignore zero-only contributions)
+    # Blend tile frequencies
     blended_freq = {t: 0.0 for t in VALID_TILES}
-    normalization = {t: 0.0 for t in VALID_TILES}
-
     for pid, weight in weights.items():
         for t in VALID_TILES:
             val = freqs_by_phase[pid].get(t, 0.0)
-            if val > 0.0:
-                blended_freq[t] += weight * val
-                normalization[t] += weight
+            blended_freq[t] += weight * val
 
-    # Normalize blended frequencies only where applicable
-    for t in VALID_TILES:
-        if normalization[t] > 0:
-            blended_freq[t] /= normalization[t]
+    # Step 2: Normalize the whole distribution
+    total = sum(blended_freq.values())
+    if total > 0:
+        blended_freq = {t: v / total for t, v in blended_freq.items()}
+    else:
+        blended_freq = {t: 1.0 / len(VALID_TILES) for t in VALID_TILES}
 
-
-    # Adaptive Correction Based on Row/Column Placement
-    if frequency_matrix is not None:
-        region_tag = blended_phases_map[y][x]
-        actual_counts = {}
-
-        if directions in [{"left"}, {"right"}]:
-            row_vals = [
-                frequency_matrix[y][i]
-                for i in range(x)
-                if blended_phases_map[y][i] == region_tag
-            ]
-            actual_counts = dict(Counter(row_vals))
-
-        elif directions in [{"top"}, {"bottom"}]:
-            col_vals = [
-                frequency_matrix[i][x]
-                for i in range(y)
-                if blended_phases_map[i][x] == region_tag
-            ]
-            actual_counts = dict(Counter(col_vals))
-        else:
-            actual_counts = {}
-
+    # Rectangular Memory Region Correction
+    actual_counts = {}
+    if frequency_matrix is not None and region_tag:
+        for yy in range(region_min_y, y + 1):
+            for xx in range(region_min_x, region_max_x + 1):
+                if (yy < y or (yy == y and xx < x)) and blended_phases_map[yy][xx] == region_tag:
+                    t = frequency_matrix[yy][xx]
+                    actual_counts[t] = actual_counts.get(t, 0) + 1
         total_placed = sum(actual_counts.values())
-        if total_placed > 0:
-            local_freqs = {k: actual_counts.get(k, 0) / total_placed for k in VALID_TILES}
-            # Blend local observed with target blend: e.g., 80/20
-            for t in VALID_TILES:
-                blended_freq[t] = 0.8 * blended_freq[t] + 0.2 * local_freqs.get(t, 0.0)
+    else:
+        total_placed = 0
 
-    # Allowed tiles (intersection of phase constraints and local constraints)
+    # Apply constraints
     allowed_tiles = set()
     for pid in phase_indices:
         allowed_tiles.update(phases[pid].get("allowed_tiles", []))
-
     constraint_allowed = set()
-    for constraint in constraints:
-        constraint_allowed.update({t for t in constraint if t in VALID_TILES})
-
+    if isinstance(constraints, dict):
+        for k in ["disallow_tile_types", "allowed_tiles"]:
+            constraint_allowed.update({t for t in constraints.get(k, []) if t in VALID_TILES})
     if constraint_allowed:
         allowed_tiles &= constraint_allowed
-
-    # Adjusted probabilities
-    adjusted_probs = {t: blended_freq[t] if t in allowed_tiles else 0.0 for t in VALID_TILES}
-    total = sum(adjusted_probs.values())
-    if total > 0:
-        adjusted_probs = {k: v / total for k, v in adjusted_probs.items()}
-    else:
-        fallback = list(allowed_tiles) if allowed_tiles else list(VALID_TILES)
-        adjusted_probs = {k: 1.0 / len(fallback) for k in fallback}
-        for k in VALID_TILES:
-            if k not in adjusted_probs:
-                adjusted_probs[k] = 0.0
 
     # Possibility matrix
     possibility_matrix = np.zeros((4, 1), dtype=int)
@@ -898,6 +1058,27 @@ def get_effective_transition_tile_policy(
         if t in VALID_TILES:
             possibility_matrix[[0, 2, 3, 4].index(t), 0] = 1
 
+    adjusted_probs = adjust_probabilities(
+        frequency_targets=blended_freq,
+        placed_counts=actual_counts,
+        total_tiles_placed=total_placed,
+        tile_possibility_matrix=possibility_matrix,
+        mode="transition",
+        weight=alpha
+    )
+    # with open(LOG_FILE, mode='a', newline='') as f:
+    #     writer = csv.writer(f)
+    #     writer.writerow([
+    #         x, y,
+    #         direction,
+    #         round(alpha, 3),
+    #         ";".join(map(str, phase_indices)),
+    #         current_phase,
+    #         str(weights),
+    #         str(blended_freq),
+    #         str(actual_counts),
+    #         str(adjusted_probs)
+    #     ])
     return adjusted_probs, possibility_matrix
 
 def clear_output_folder(folder_path, exceptions=None):
@@ -1005,7 +1186,7 @@ class PhaseTab(QWidget):
             row_layout.addWidget(spinbox)
             row_layout.addWidget(percent_label)
             row.setLayout(row_layout)
-            tile_layout.addRow(f"Tyle R type {t}", row) 
+            tile_layout.addRow(f"Tile R type {t}", row) 
         # --- Group for Advanced Connectivity Rules ---
         self.advanced_group = QGroupBox(f"Advanced Connectivity Rules for {phase_name}")
         advanced_group_layout = QVBoxLayout()
@@ -1100,7 +1281,7 @@ class PhaseTab(QWidget):
         if abs(weighted_sum - target) > 0.02:
             self.feedback_label.setText(f"❌ Coordination mismatch (target: {target:.2f})")
         else:
-            self.feedback_label.setText("✅ Coordination matches within 0.05 accuracy ")
+            self.feedback_label.setText("✅ Coordination matches within 0.02 accuracy ")
             
     def toggle_advanced_rules(self, state):
         is_checked = state == Qt.Checked
@@ -1248,10 +1429,6 @@ class MainApp(QWidget):
         stl_group_layout.addWidget(grid_wall_group)
         self.add_horizontal_walls.stateChanged.connect(self.update_phase_config)
         self.add_vertical_walls.stateChanged.connect(self.update_phase_config)
-        # Base plate checkbox
-        # self.base_plate_checkbox = QCheckBox("Add 1mm thick base plate below structure")
-        # self.base_plate_checkbox.setChecked(False)
-        # stl_group_layout.addWidget(self.base_plate_checkbox)
         stl_group.setLayout(stl_group_layout)
         self.page1_layout.addWidget(stl_group)
         # Phase layout sliders and grid preview
@@ -1424,7 +1601,6 @@ class MainApp(QWidget):
         walls = loaded.get("add_outer_walls", {})
         self.add_horizontal_walls.setChecked(walls.get("horizontal", True))
         self.add_vertical_walls.setChecked(walls.get("vertical", True))
-        # self.base_plate_checkbox.setChecked(bool(loaded.get("add_base_plate", False)))
         self.output_path.setText(str(loaded.get("output_path", "")))
         self.computed_grid_width = loaded.get("grid_width", 0)
         self.computed_grid_height = loaded.get("grid_height", 0)
@@ -1719,7 +1895,6 @@ class MainApp(QWidget):
                     "horizontal":  bool(self.add_horizontal_walls.isChecked()),
                     "vertical":  bool(self.add_vertical_walls.isChecked()),
                 },
-            # "add_base_plate": bool(self.base_plate_checkbox.isChecked()),
             "blend_enabled": bool(blend_enabled),
             "blend_harshness": blend_harshness,
             "transition_layer": transition_layer_margins,
@@ -1910,7 +2085,6 @@ def save_final_matrix_as_svg(
 ):
     assert tile_svgs is not None, "You must pass tile_svgs (from precompute_tile_svgs)"
     
-    # --- Get settings
     add_vertical = settings.get("add_outer_walls", {}).get("vertical", False)
     add_horizontal = settings.get("add_outer_walls", {}).get("horizontal", False)
     phase_rows = settings["phase_layout"]["rows"]
@@ -1918,7 +2092,6 @@ def save_final_matrix_as_svg(
     grid_width = settings["grid_width"]
     grid_height = settings["grid_height"]
 
-    # Full tile grid size (includes padding)
     total_rows = len(grid)
     total_cols = len(grid[0])
 
@@ -2127,7 +2300,6 @@ def svg_to_stl_from_grid(
     tile_size_mm=1.0,
     line_thickness=0.2,
     extrusion_height=1.0,
-    #add_base_plate=False,
     known_tile_types=None
 ):
     print("[STL] Generating STL from svg...")
@@ -2202,14 +2374,6 @@ def svg_to_stl_from_grid(
             extruded = trimesh.creation.extrude_polygon(poly, extrusion_height, engine="earcut")
             if extruded.volume > 0:
                 extruded_meshes.append(extruded)
-    # if add_base_plate:
-    #     width = (grid_width + 2) * tile_size_mm
-    #     height = (grid_height + 2) * tile_size_mm
-    #     base = trimesh.creation.box(
-    #         extents=(width, height, 1.0),
-    #         transform=trimesh.transformations.translation_matrix([width / 2, height / 2, -1.0])
-    #     )
-        # extruded_meshes.append(base)
     if extruded_meshes:
         final_mesh = trimesh.util.concatenate(extruded_meshes)
         final_mesh.export(stl_path, file_type='stl')
@@ -2370,7 +2534,7 @@ def run_tile_generation_VGA(adjustment_mode, weight, phases,
             if blend_mask[y, x]:
                 blend_weight_map[y][x] = get_rule_blend_weights(
                     x, y,
-                    blended_phases_map[y][x],
+                    neighbor_phases=blended_phases_map[y][x],
                     phase_map=phase_map,
                     tiles_per_phase_x=tiles_x,
                     tiles_per_phase_y=tiles_y,
@@ -2391,9 +2555,8 @@ def run_tile_generation_VGA(adjustment_mode, weight, phases,
                     phases=phases,
                     constraints=constraints,
                     direction_map=blend_directions,
-                    tiles_per_phase_x=tiles_x,
-                    tiles_per_phase_y=tiles_y,
-                    frequency_matrix=frequency_matrix
+                    frequency_matrix=frequency_matrix,
+                    blend_mask=blend_mask
                 )
             else:
                 adjusted_probs, possibility_matrix = get_effective_tile_policy(
@@ -2592,22 +2755,19 @@ def main_simulation_logic(settings):
     ]
     blended_phases_map = [
     [set(cell) for cell in row] for row in settings.get("blended_phases_map", [[]])
-]
+    ]
     
-    np.savetxt(os.path.join(OUTPUT_PATH, "blend_mask.csv"), blend_mask.astype(int), fmt="%d", delimiter=",")
-    # --- Save direction_map as CSV (string representation of sets) ---
-    with open(os.path.join(OUTPUT_PATH, "blend_directions.csv"), "w", newline='') as f:
-        writer = csv.writer(f)
-        for row in blend_directions:
-            writer.writerow([",".join(sorted(d)) if d else "" for d in row])
-    # print("[DEBUG] Transition zone — x:", x_shrink, "y:", y_shrink)
-    # #print("[DEBUG] Blend mask coverage:")
-    # #print("Total blend tiles:", np.sum(blend_mask))
-    # print("Coverage (%):", 100 * np.sum(blend_mask) / (blend_mask.shape[0] * blend_mask.shape[1]))
-    # save_blend_mask_image(blend_mask, os.path.join(OUTPUT_PATH, "blend_mask_debug.png"))
-    # save_phase_blend_overlay(phase_map, blend_mask, os.path.join(OUTPUT_PATH, "phase_blend_overlay.png"))
     # np.savetxt(os.path.join(OUTPUT_PATH, "blend_mask.csv"), blend_mask.astype(int), fmt="%d", delimiter=",")
-    
+    # with open(os.path.join(OUTPUT_PATH, "blended_phases_map.csv"), "w", newline="") as f:
+    #     writer = csv.writer(f)
+    #     for row in blended_phases_map:
+    #         writer.writerow([";".join(map(str, sorted(cell))) if cell else "" for cell in row])
+    # np.savetxt(os.path.join(OUTPUT_PATH, "phase_map.csv"),phase_map.astype(int), fmt="%d", delimiter=",")
+    # # --- Save direction_map as CSV (string representation of sets) ---
+    # with open(os.path.join(OUTPUT_PATH, "blend_directions.csv"), "w", newline='') as f:
+    #     writer = csv.writer(f)
+    #     for row in blend_directions:
+    #         writer.writerow([",".join(sorted(d)) if d else "" for d in row])    
     print("Running the simmulaiton creating the geometries")
     for phase in settings["phases"]:
         if "tile_frequencies" in phase:
@@ -2683,17 +2843,17 @@ def main_simulation_logic(settings):
             annotate=True,
             tile_svgs=tile_svgs
         )
-        matrix_csv_path = os.path.join(OUTPUT_PATH, f"best_final_matrix_{i}_frequencies.csv")
-        pd.DataFrame(matrix).to_csv(matrix_csv_path, index=False)
-        grid_csv_path = os.path.join(OUTPUT_PATH, f"best_grid_matrix_{i}.csv")
+        #matrix_csv_path = os.path.join(OUTPUT_PATH, f"best_final_matrix_{i}_frequencies.csv")
+        #pd.DataFrame(matrix).to_csv(matrix_csv_path, index=False)
+        #grid_csv_path = os.path.join(OUTPUT_PATH, f"best_grid_matrix_{i}.csv")
         expanded_rows = []
         for y in range(grid_with_boundaries.shape[0]):
             for x in range(grid_with_boundaries.shape[1]):
                 tile = grid_with_boundaries[y, x]
                 expanded_rows.append(tile.flatten().tolist())
-        grid_df = pd.DataFrame(expanded_rows)
-        grid_df.to_csv(grid_csv_path, index=False)
-        dict_matrix_csv_path = os.path.join(OUTPUT_PATH, f"best_final_matrix_{i}_dict_matrix.csv")
+        #grid_df = pd.DataFrame(expanded_rows)
+        #grid_df.to_csv(grid_csv_path, index=False)
+        #dict_matrix_csv_path = os.path.join(OUTPUT_PATH, f"best_final_matrix_{i}_dict_matrix.csv")
         #df_dict_matrix = pd.DataFrame([
         #     [cell["sum"] if isinstance(cell, dict) else "" for cell in row]
         #     for row in tile_dict_matrix_with_boundaries
@@ -2709,7 +2869,6 @@ def main_simulation_logic(settings):
                 tile_size_mm=settings["tile_size_mm"],
                 line_thickness=settings["line_thickness"],
                 extrusion_height=settings["extrusion_height"],
-                #add_base_plate=settings.get("add_base_plate", False),
                 known_tile_types=tile_types
             )
             generate_inverse_stl(
@@ -2761,4 +2920,15 @@ if __name__ == "__main__":
     run_input_gui()
     with open("settings.json", "r") as f:
         settings = json.load(f)
+    # OUTPUT_PATH = settings["output_path"]
+    # LOG_FILE = os.path.join(OUTPUT_PATH, "tile_policy_debug_log.csv")
+    # if not os.path.exists(LOG_FILE):
+    #     with open(LOG_FILE, mode='w', newline='') as f:
+    #         writer = csv.writer(f)
+    #         writer.writerow([
+    #             "x", "y", "direction", "alpha",
+    #             "phase_indices", "current_phase",
+    #             "weights", "blended_freq", 
+    #             "actual_counts", "adjusted_probs"
+    #         ])
     main_simulation_logic(settings)
