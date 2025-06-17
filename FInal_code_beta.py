@@ -235,22 +235,22 @@ def adjust_probabilities(frequency_targets, placed_counts, total_tiles_placed, t
     adjusted_weights = {}
     for tile_type, diff in diffs.items():
         expected_count = max(frequency_targets.get(tile_type, 0.001) * total_tiles_placed, 1e-6)
-        # Scale diff by how much this tile affects coordination
         impact = coordination_weight.get(tile_type, 1.0)
         scaled_diff = diff * impact
         relative_diff = scaled_diff / expected_count
+
+        # NEW: In transition mode, heavily penalize tile type 3 if overused
+        if mode == "transition" and tile_type == 3 and diff <= 0:
+            adjusted_weights[tile_type] = 0.0001
+            continue  # Skip to next tile
         if diff <= 0 and tile_type in [0, 4]:  # overused tiles are banned
             adjusted_weights[tile_type] = 0.0
         else:
-            # Coordination-sensitive adjustment
             raw_adjustment = 1 + weight * relative_diff
-            # Slight overboost for tile 0 to catch up more aggressively if needed
             if tile_type == 0:
-                raw_adjustment *= 1.5
-            # Limit the top frequency not to eliminate randomness
+                raw_adjustment *= 1.5  # Boost recovery for tile 0
             capped = min(max(raw_adjustment, 0.01), 6.0 if tile_type in [0, 4] else 2.0)
             adjusted_weights[tile_type] = capped
-    # Remove any disallowed tiles completely
     for tile_type in [0, 2, 3, 4]:
         if tile_possibility_matrix[tile_type_to_index[tile_type], 0] == 0:
             adjusted_weights[tile_type] = 0.0
@@ -956,15 +956,14 @@ def get_effective_transition_tile_policy(
 
     def compute_alpha_from_box(min_y, max_y, min_x, max_x, direction):
         if direction == "top":
-            return (y - min_y) / max((max_y - min_y), 1)  # from top to bottom
+            return (max_y - y) / max((max_y - min_y), 1)  
         elif direction == "bottom":
-            return (max_y - y) / max((max_y - min_y), 1)  # from bottom to top
+            return (y - min_y) / max((max_y - min_y), 1)  
         elif direction == "left":
-            return (x - min_x) / max((max_x - min_x), 1)  # from left to right
+            return (max_x - x) / max((max_x - min_x), 1)  # reversed
         elif direction == "right":
-            return (max_x - x) / max((max_x - min_x), 1)  # from right to left
+            return (x - min_x) / max((max_x - min_x), 1)
         else:
-            # fallback if unknown direction
             norm_y = (y - min_y) / max((max_y - min_y), 1)
             norm_x = (x - min_x) / max((max_x - min_x), 1)
             return 0.5 * (norm_x + norm_y)
@@ -1158,12 +1157,26 @@ class PhaseTab(QWidget):
             spinbox.setEnabled(False)
 
             percent_label = QLabel("0%")
-            self.frequency_labels[t] = percent_label  # Save for updates
+            self.frequency_labels[t] = percent_label
 
-            #spinbox live update connections
+            tile_name = f"Tile R type {t}"
+            example_tile = self.get_example_tile_for_type(t)
+            preview = self.create_tile_preview(example_tile)
+
+            row = QWidget()
+            row_layout = QHBoxLayout()
+            row_layout.addWidget(QLabel(tile_name))
+            row_layout.addWidget(preview)
+            row_layout.addWidget(cb)
+            row_layout.addWidget(spinbox)
+            row_layout.addWidget(percent_label)
+            row.setLayout(row_layout)
+
+            tile_layout.addRow(row)
+
+            # Signal connections
             spinbox.valueChanged.connect(lambda val, r=t: self.update_spinbox_label(r))
             spinbox.valueChanged.connect(self.validate_frequency_match)
-        
 
             def make_toggle_handler(spinbox=spinbox, label=percent_label, t=t):
                 def toggle(state):
@@ -1180,13 +1193,13 @@ class PhaseTab(QWidget):
             self.tile_checkboxes[t] = cb
             self.frequency_spinbox[t] = spinbox
             
-            row = QWidget()
-            row_layout = QHBoxLayout()
-            row_layout.addWidget(cb)
-            row_layout.addWidget(spinbox)
-            row_layout.addWidget(percent_label)
-            row.setLayout(row_layout)
-            tile_layout.addRow(f"Tile R type {t}", row) 
+            # row = QWidget()
+            # row_layout = QHBoxLayout()
+            # row_layout.addWidget(cb)
+            # row_layout.addWidget(spinbox)
+            # row_layout.addWidget(percent_label)
+            # row.setLayout(row_layout)
+            # tile_layout.addRow(f"Tile R type {t}", row) 
         # --- Group for Advanced Connectivity Rules ---
         self.advanced_group = QGroupBox(f"Advanced Connectivity Rules for {phase_name}")
         advanced_group_layout = QVBoxLayout()
@@ -1225,6 +1238,18 @@ class PhaseTab(QWidget):
     def update_spinbox_label(self, r):
         val = self.frequency_spinbox[r].value()
         self.frequency_labels[r].setText(f"{val}%")
+        
+    def get_example_tile_for_type(self, t):
+        if t == 0:
+            return "tile_0"
+        elif t == 2:
+            return "tile_2_LR"
+        elif t == 3:
+            return "tile_3_noT"  
+        elif t == 4:
+            return "tile_4"  
+        else:
+            return []
     
     def toggle_frequency_spinbox(self):
         enabled = self.manual_input.isChecked()
@@ -1288,6 +1313,25 @@ class PhaseTab(QWidget):
         self.advanced_rules_box.setVisible(is_checked)
         for cb in self.advanced_checkboxes.values():
             cb.setEnabled(is_checked)
+            
+    def create_tile_preview(self, tile_type, tile_size=1.0):
+        dwg = svgwrite.Drawing(size=(tile_size, tile_size))
+
+        group = render_tile_svg_group(
+            create_tile_geometry(tile_type, tile_size),
+            tile_size,
+            flip_x=False,
+            invert_y=True
+        )
+
+        dwg.add(group)
+
+        svg_str = dwg.tostring()
+        byte_data = QByteArray(svg_str.encode("utf-8"))
+        svg_widget = QSvgWidget()
+        svg_widget.load(byte_data)
+        svg_widget.setFixedSize(40, 40)
+        return svg_widget
             
     def create_rule_preview(self, tile_before, tile_after, tile_size=1.0):
         dwg = svgwrite.Drawing(size=(tile_size * 2, tile_size))
@@ -1386,6 +1430,13 @@ class MainApp(QWidget):
         self.num_samples_spinbox.setRange(1, 3)
         self.num_samples_spinbox.setValue(1)
         stl_top_row_layout.addWidget(self.num_samples_spinbox)
+        stl_top_row_layout.addWidget(QLabel("Iterations over Simulation (packages of 5):"))
+        self.iterations_spinbox = QSpinBox()
+        self.iterations_spinbox.setRange(1, 25)  
+        self.iterations_spinbox.setSingleStep(1)  
+        self.iterations_spinbox.setValue(10)      
+        self.iterations_spinbox.setToolTip("Each iteration runs 5 independent simulations.")
+        stl_top_row_layout.addWidget(self.iterations_spinbox)
         stl_group_layout.addLayout(stl_top_row_layout)
         # Tile size input 
         tile_size_layout = QHBoxLayout()
@@ -1404,7 +1455,7 @@ class MainApp(QWidget):
         self.line_thickness.setSingleStep(0.05)
         self.line_thickness.setValue(0.1)
         self.update_thickness_constraints()
-        thickness_layout.addWidget(QLabel("Hard matrix strut Thickness [mm]:"))
+        thickness_layout.addWidget(QLabel("Inclusion strut Thickness [mm]:"))
         thickness_layout.addWidget(self.line_thickness)
         stl_group_layout.addLayout(thickness_layout)
         # Extrusion height input
@@ -1597,6 +1648,7 @@ class MainApp(QWidget):
         self.line_thickness.setValue(float(loaded.get("line_thickness", 0.2)))
         self.extrusion_height.setValue(float(loaded.get("extrusion_height", 2.0)))
         self.num_samples_spinbox.setValue(int(loaded.get("num_samples", 1)))
+        self.iterations_spinbox.setValue(int(loaded.get("num_iterations", 10)))
         self.stl_choice_checkbox.setChecked(bool(loaded.get("stl", True)))
         walls = loaded.get("add_outer_walls", {})
         self.add_horizontal_walls.setChecked(walls.get("horizontal", True))
@@ -1795,6 +1847,7 @@ class MainApp(QWidget):
             return
         tile_size_mm = float(self.tile_size_mm.value())
         num_samples=  int(self.num_samples_spinbox.value())
+        itterations= int(self.iterations_spinbox.value())
         extrusion_height = float(self.extrusion_height.value())
         line_thickness = float(self.line_thickness.value())
         stl_width = int(self.stl_width_mm.value())
@@ -1883,6 +1936,7 @@ class MainApp(QWidget):
             "line_thickness": line_thickness,
             "tile_size_mm": tile_size_mm,
             "num_samples": num_samples,
+            "num_iterations": itterations,
             "stl_dimensions_mm": {
                 "desired": [stl_width, stl_height],
                 "actual": [
@@ -2027,8 +2081,7 @@ def render_tile_svg_group(tile_lines, tile_size=1.0, tile_type="", flip_x=True, 
     )
     p = Path(stroke='black', stroke_width=0.05, fill='none')
     added = False  
-
-    # Assign transformation functions
+    
     fx = (lambda x: tile_size - x) if flip_x else (lambda x: x)
     fy = (lambda y: tile_size - y) if invert_y else (lambda y: y)
 
@@ -2104,13 +2157,16 @@ def save_final_matrix_as_svg(
         size=(f"{total_cols * tile_size}cm", f"{total_rows * tile_size}cm"),
         viewBox=f"0 0 {total_cols * tile_size} {total_rows * tile_size}"
     )
+    center_x = total_cols * tile_size / 2
+    center_y = total_rows * tile_size / 2
+
+    main_group = dwg.g(transform=f"rotate(180,{center_x},{center_y})")
     dwg.add(dwg.rect(
         insert=(0, 0),
         size=(total_cols * tile_size, total_rows * tile_size),
         fill='white'
     ))
 
-    # --- Render grid with tile SVGs and blend zone highlights
     for y in range(total_rows):
         for x in range(total_cols):
             tx = x * tile_size
@@ -2133,7 +2189,7 @@ def save_final_matrix_as_svg(
                 tile_group.translate(tx, ty)
                 dwg.add(tile_group)
 
-    # --- Annotation (phase lines, blend edges, border box)
+    # Annotation (phase lines, blend edges, border box)
     if annotate:
         rows_per_phase = grid_height // phase_rows
         cols_per_phase = grid_width // phase_cols
@@ -2141,7 +2197,7 @@ def save_final_matrix_as_svg(
         cyan_style = {'stroke': 'cyan', 'stroke_width': tile_size * 0.1}
         orange_style = {'stroke': 'orange', 'stroke_width': tile_size * 0.15, 'fill': 'none'}
 
-        # Draw phase division lines
+        # Phase division lines
         for i in range(1, phase_rows):
             y = (i * rows_per_phase + y_offset) * tile_size
             dwg.add(dwg.line(
@@ -2181,7 +2237,7 @@ def save_final_matrix_as_svg(
             size=(grid_width * tile_size, grid_height * tile_size),
             fill='none', stroke='purple', stroke_width=tile_size * 0.1
         ))
-
+    dwg.add(main_group)
     dwg.save()
     
 def clip_to_tile_bounds(geometry, point, tile_size_mm):
@@ -2220,37 +2276,45 @@ def debug_save_buffered_svg(buffered_shapes, out_path, tile_size_mm):
     if not all_bounds:
         print("[DEBUG] No shapes to draw.")
         return
+
     min_x = min(b[0] for b in all_bounds)
     min_y = min(b[1] for b in all_bounds)
     max_x = max(b[2] for b in all_bounds)
     max_y = max(b[3] for b in all_bounds)
     width = max_x - min_x
     height = max_y - min_y
+
     dwg.viewbox(min_x, min_y, width, height)
 
-    dwg.add(dwg.rect(
+    #Apply 180° rotation around center of bounding box ===
+    rotation_center_x = min_x + width / 2
+    rotation_center_y = min_y + height / 2
+    transform_string = f"rotate(180,{rotation_center_x},{rotation_center_y})"
+
+    main_group = dwg.g(transform=transform_string)
+
+    # Background
+    main_group.add(dwg.rect(
         insert=(min_x, min_y),
         size=(width, height),
         fill='white'
     ))
+
     for shape in buffered_shapes:
         if shape.is_empty:
             continue
-
         if isinstance(shape, (Polygon, MultiPolygon)):
             polys = [shape] if isinstance(shape, Polygon) else shape.geoms
-
             for poly in polys:
                 minx, miny, maxx, maxy = poly.bounds
                 is_tile_box = (
                     abs(maxx - minx - tile_size_mm) < 1e-6 and
                     abs(maxy - miny - tile_size_mm) < 1e-6
                 )
-
                 fill_color = 'black'
                 stroke_color = 'black' if is_tile_box else 'black'
 
-                dwg.add(dwg.polygon(
+                main_group.add(dwg.polygon(
                     points=list(poly.exterior.coords),
                     fill=fill_color,
                     fill_opacity=0.4,
@@ -2258,6 +2322,7 @@ def debug_save_buffered_svg(buffered_shapes, out_path, tile_size_mm):
                     stroke_width=0.02
                 ))
 
+    dwg.add(main_group)
     dwg.save()
     #print(f"[DEBUG] Buffered shapes saved to: {out_path}")
     
@@ -2432,7 +2497,6 @@ def generate_inverse_stl(
         print(f"[INVERSE STL] Saved to: {out_path}")
     else:
         print("[INVERSE STL ERROR] No inverse mesh created.")
-
 #######################################################################################################################################################
 #POSTPROCESSING graphs visualisation
 def plot_iteration_error_summary(summary_log, output_dir):
@@ -2522,12 +2586,12 @@ def run_tile_generation_VGA(adjustment_mode, weight, phases,
     frequency_matrix = np.zeros((GRID_HEIGHT, GRID_WIDTH), dtype=int)
     tile_dict_matrix = [[None for _ in range(GRID_WIDTH)] for _ in range(GRID_HEIGHT)]
 
-    # === Extract enforced phase rules
+    # Extract enforced phase rules
     phase_enforced_rules = {
         i: p.get("connectivity_rules", {}) for i, p in enumerate(phases)
     }
 
-    # === Precompute blend weights per tile
+    # Precompute blend weights per tile
     blend_weight_map = [[{} for _ in range(GRID_WIDTH)] for _ in range(GRID_HEIGHT)]
     for y in range(GRID_HEIGHT):
         for x in range(GRID_WIDTH):
@@ -2546,7 +2610,7 @@ def run_tile_generation_VGA(adjustment_mode, weight, phases,
             constraints = generation_demo_1_grid_constraints(x, y, grid)
             current_phase = phase_map[y][x]
 
-            # === Get tile probabilities & allowed types
+            #Rile probabilities & allowed types
             if blend_mask[y, x] and isinstance(blend_directions[y][x], (list, set)):
                 adjusted_probs, possibility_matrix = get_effective_transition_tile_policy(
                     x, y,
@@ -2567,7 +2631,7 @@ def run_tile_generation_VGA(adjustment_mode, weight, phases,
                     blend_mask
                 )
 
-            # === Select tile type with rule filtering (DEMO 2)
+            # Tile type with rule filtering 
             chosen_sum = generation_demo_2_filter_tile_options(
                 constraints=constraints,
                 grid=grid,
@@ -2584,7 +2648,7 @@ def run_tile_generation_VGA(adjustment_mode, weight, phases,
                 tiles_per_phase_y=tiles_y
             )
 
-            # === Assign connections (DEMO 3)
+            # Assign connections 
             active_connections = generation_demo_3_assign_remaining_connections(
                 grid=grid,
                 x=x, y=y,
@@ -2597,10 +2661,10 @@ def run_tile_generation_VGA(adjustment_mode, weight, phases,
                 blend_weight_map=blend_weight_map
             )
 
-            # === Build tile from connection pattern (DEMO 4)
+            # Build tile from connection pattern with the steps
             tile, confirmed_sum = generation_demo_4_construct_tile(active_connections, chosen_sum)
 
-            # === Write results
+            # Write results
             grid[y, x] = tile
             saved_matrix[y * TILE_SIZE:(y + 1) * TILE_SIZE, x * TILE_SIZE:(x + 1) * TILE_SIZE] = tile
             frequency_matrix[y, x] = confirmed_sum
@@ -2785,7 +2849,7 @@ def main_simulation_logic(settings):
     tile_size=TILE_SIZE,
     tiles_x=settings["tiles_per_phase_x"],
     tiles_y=settings["tiles_per_phase_x"],
-    iterations=10
+    iterations=settings["num_iterations"]
     )
     # grid_path = os.path.join(OUTPUT_PATH, f"grid_path.csv")
     # pd.DataFrame(grid).to_csv(grid_path, index=False)
